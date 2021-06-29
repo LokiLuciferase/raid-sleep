@@ -8,8 +8,6 @@ from subprocess import Popen, PIPE
 
 
 def parse_args():
-    global args
-
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=textwrap.dedent('''\
@@ -18,7 +16,7 @@ def parse_args():
 
             %(prog)s comes with ABSOLUTELY NO WARRANTY. This is free software,
             and you are welcome to redistribute it under certain conditions.
-            See the GNU General Public Licence version 3 (or later) for details.       
+            See the GNU General Public Licence version 3 (or later) for details.
         ''')
     )
 
@@ -45,43 +43,20 @@ def parse_args():
     )
 
     args = parser.parse_args()
-
     args.disk_devs = [os.path.realpath(d) for d in args.disk]
+    return args
 
 
-def dprint(*message):
-    if args.verbose:
-        for s in message:
-            print(s, end=" ")
-        print()
-
-
-def power_down():
-    # hdparm may take a long time, so execute in parallel
-    #
-    for p in [
-        Popen(["hdparm", "-y", d], stdout=PIPE)
-        for d in args.disk_devs
-    ]:
-        p.wait()
-
-
-def wake_up():
-    for p in [
-        Popen(["hdparm", "--read-sector", "0", d], stdout=PIPE)
-        for d in args.disk_devs
-    ]:
-        p.wait()
-
-
-def diskstats():
+def diskstats(disks=None):
     # see https://www.kernel.org/doc/Documentation/iostats.txt
     #
     columns = [
         "major_dev_num", "minor_dev_num", "device",
         "reads", "reads_merged", "sectors_read", "ms_reading",
         "writes", "writes_merged", "sectors_written", "ms_writing",
-        "current_ios", "ms_doing_io", "weighted_ms_doing_io"
+        "current_ios", "ms_doing_io", "weighted_ms_doing_io",
+        "discards_ok", "discards_merged", "sectors_discarded", "t_discarding",
+        "flush_req_ok", "t_flushing"
     ]
 
     result = {}
@@ -96,7 +71,48 @@ def diskstats():
             k: int(v) for k, v in list(data.items()) if k != "device"
         }
 
+    if disks is not None:
+        result = {k: v for k, v in result.items() if k in disks}
+
     return result
+
+
+def dprint(*message, verbose=True):
+    if verbose:
+        for s in message:
+            print(s, end=" ")
+        print()
+
+
+def power_down(disks):
+    # hdparm may take a long time, so execute in parallel
+    #
+    for p in [
+        Popen(["hdparm", "-y", d], stdout=PIPE)
+        for d in disks
+    ]:
+        p.wait()
+
+    time.sleep(2)  # grace period while hdparm -y may cause disk I/O
+    pd_stats = diskstats(disks)  # recreate stats after timeout
+    return pd_stats
+
+
+def wake_up(disks):
+    for p in [
+        Popen(["hdparm", "--read-sector", "0", d], stdout=PIPE)
+        for d in disks
+    ]:
+        p.wait()
+
+
+def stat_diff(old_stats, new_stats):
+    out = {k: {} for k in old_stats.keys()}
+    for k in old_stats.keys():
+        for kk in old_stats[k].keys():
+            if old_stats[k][kk] != new_stats[k][kk]:
+                out[k][kk] = (old_stats[k][kk], new_stats[k][kk])
+    return out
 
 
 def hms(s):
@@ -104,42 +120,44 @@ def hms(s):
 
 
 # ----- ----- ----- ----- -----
+def main():
+    args = parse_args()
+    old_stats = None
+    last_access = time.time()
+    last_standby = last_access
+    disk_state = 1
 
-old_stats = None
-last_access = time.time()
-last_standby = last_access
-disk_state = 1
-
-parse_args()
-
-dprint(
-    "Monitoring %s. Timeout = %s" % (
-        ", ".join(args.disk_devs), hms(args.timeout)
+    dprint(
+        "Monitoring %s. Timeout = %s" % (
+            ", ".join(args.disk_devs), hms(args.timeout)
+        )
+        , verbose=args.verbose
     )
-)
 
-while True:
-    stats = diskstats()
-    stats = {k: v for k, v in list(stats.items()) if k in args.disk_devs}
+    while True:
+        stats = diskstats(args.disk_devs)
+        now = time.time()
 
-    now = time.time()
+        if old_stats and old_stats != stats:
+            if disk_state == 0:
+                disk_state = 1
+                last_standby = now
 
-    if old_stats and old_stats != stats:
-        if disk_state == 0:
-            disk_state = 1
-            last_standby = now
+                dprint("Waking up after %s of inactivity" % hms(now - last_access), verbose=args.verbose)
+                wake_up(args.disk_devs)
 
-            dprint("Waking up after %s of inactivity" % hms(now - last_access))
-            wake_up()
+            last_access = now
 
-        last_access = now
+        if now - last_access > args.timeout:
+            if disk_state == 1:
+                disk_state = 0
 
-    if now - last_access > args.timeout:
-        if disk_state == 1:
-            disk_state = 0
+                dprint("Powering down after %s" % hms(now - last_standby), verbose=args.verbose)
+                stats = power_down(args.disk_devs)
 
-            dprint("Powering down after %s" % hms(now - last_standby))
-            power_down()
+        old_stats = stats
+        time.sleep(1)
 
-    old_stats = stats
-    time.sleep(1)
+
+if __name__ == '__main__':
+    main()
